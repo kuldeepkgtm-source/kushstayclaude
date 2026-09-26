@@ -13,3 +13,4 @@ Artisan::command('inspire', function () {
 // per task, and no long-running Node/PHP process required.
 Schedule::command('ical:sync')->everyFifteenMinutes()->withoutOverlapping();
 Schedule::command('holds:purge')->everyMinute();
+Schedule::command('pass:release-expired-reservations')->everyFiveMinutes();

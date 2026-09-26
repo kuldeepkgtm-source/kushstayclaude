@@ -17,7 +17,7 @@ return new class extends Migration {
             $table->enum('source', [
                 'WhatsApp AI', 'Direct', 'Website', 'Walk-in', 'Phone',
                 'Booking.com', 'Airbnb', 'MakeMyTrip', 'Goibibo', 'Other OTA',
-                'iCal Import', 'Manual/Admin',
+                'iCal Import', 'Manual/Admin', 'Pass',
             ]);
             $table->date('check_in');
             $table->date('check_out');

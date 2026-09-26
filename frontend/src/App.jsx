@@ -2108,24 +2108,22 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const res = { value: window.localStorage.getItem("appState") };
-        if (!cancelled && res && res.value) {
-          const data = JSON.parse(res.value);
-          if (Array.isArray(data.bookings) && data.bookings.length) setBookings(data.bookings);
-          if (Array.isArray(data.leads)) setLeads(data.leads);
-          if (Array.isArray(data.otaConnections) && data.otaConnections.length) setOtaConnections(data.otaConnections);
-          if (data.blockedBeds) setBlockedBeds(data.blockedBeds);
-          if (data.customerExtras) setCustomerExtras(data.customerExtras);
-          if (data.prices) setPrices(data.prices);
-          if (data.settings) setSettings(data.settings);
-          if (data.aiStats) setAiStats(data.aiStats);
-          if (data.catalogActive) setCatalogActive(data.catalogActive);
-        }
-      } catch (e) { /* nothing saved yet — keep seed demo data */ }
-      if (!cancelled) setLoaded(true);
-    })();
+    try {
+      const savedData = window.localStorage.getItem("appState");
+      if (!cancelled && savedData) {
+        const data = JSON.parse(savedData);
+        if (Array.isArray(data.bookings) && data.bookings.length) setBookings(data.bookings);
+        if (Array.isArray(data.leads)) setLeads(data.leads);
+        if (Array.isArray(data.otaConnections) && data.otaConnections.length) setOtaConnections(data.otaConnections);
+        if (data.blockedBeds) setBlockedBeds(data.blockedBeds);
+        if (data.customerExtras) setCustomerExtras(data.customerExtras);
+        if (data.prices) setPrices(data.prices);
+        if (data.settings) setSettings(data.settings);
+        if (data.aiStats) setAiStats(data.aiStats);
+        if (data.catalogActive) setCatalogActive(data.catalogActive);
+      }
+    } catch (e) { /* nothing saved yet — keep seed demo data */ }
+    if (!cancelled) setLoaded(true);
     return () => { cancelled = true; };
   }, []);
 
@@ -2139,7 +2137,7 @@ export default function App() {
     }, 800);
     return () => clearTimeout(saveTimer.current);
   }, [loaded, bookings, leads, otaConnections, blockedBeds, customerExtras, prices, settings, aiStats, catalogActive]);
-
+  
   const offsetRef = useRef(0);
   useEffect(() => { offsetRef.current = systemOffsetMs; }, [systemOffsetMs]);
   useEffect(() => {

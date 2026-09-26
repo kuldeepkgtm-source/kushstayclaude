@@ -41,6 +41,13 @@ class BookingService
         if ($data['check_out'] <= $data['check_in']) {
             throw new \InvalidArgumentException('check_out must be after check_in.');
         }
+        // Only a LIVE property is publicly bookable (spec: property approval §3/§15). This is the
+        // one place every booking source — WhatsApp, Pass, admin, iCal import — actually creates a
+        // row, so gating here covers all of them at once rather than re-checking per controller.
+        $property = \App\Models\Property::findOrFail($data['property_id']);
+        if (! $property->isLive() && ($data['source'] ?? null) !== 'Manual/Admin') {
+            throw new \RuntimeException("Property '{$property->name}' is not currently accepting bookings (status: {$property->status}).");
+        }
 
         $bedIds = $data['booking_type'] === 'private'
             ? Bed::where('room_id', $data['room_id'])->where('active', true)->pluck('id')->all()

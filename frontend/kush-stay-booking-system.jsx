@@ -63,9 +63,9 @@ const DEFAULT_SETTINGS = {
  * from the WhatsApp flow (see resolvePayment in WhatsAppScreen), since that's the exact
  * operation the double-booking protection guards. The remaining call sites (admin
  * BookingForm create/edit, BookingDetail's cancel/check-in/check-out buttons, OTA "Sync
- * now", and the Demo & Tests panel) still write to local state only, same as before this
- * change — each is a mechanical one-line swap to the matching apiClient function below,
- * intentionally left as a follow-up rather than rewritten wholesale in this pass.
+ * now", the Pass system, and the Demo & Tests panel) still write to local state only, same
+ * as before this change — each is a mechanical one-line swap to the matching apiClient
+ * function below, intentionally left as a follow-up rather than rewritten wholesale here.
  */
 const apiClient = {
   base(settings) { return (settings.apiBaseUrl || "").replace(/\/$/, ""); },
@@ -363,6 +363,12 @@ function buildInitialState() {
     prices: { ...DEFAULT_PRICES },
     settings: { ...DEFAULT_SETTINGS },
     aiStats: { inquiries: 41, recommendationsGiven: 32, privateUpsellShown: 8 },
+    passProducts: DEFAULT_PASS_PRODUCTS.map(p => ({ ...p })),
+    passSettings: { ...DEFAULT_PASS_SETTINGS },
+    passes: [],
+    passLedger: [],
+    passBookingsLink: [],
+    passAuditLog: [],
     catalogActive: { "AC-Upper":true,"AC-Lower":true,"NAC-Upper":true,"NAC-Lower":true,"AC-Private":true,"NAC-Private":true },
   };
 }
@@ -1040,9 +1046,6 @@ function WhatsAppScreen({ ctx }) {
     const isPayNow = method === "UPI" || method === "Card";
 
     if (ctx.settings.dataMode === "production") {
-      // Production path: the server (BookingService, inside a DB transaction with row locks) is
-      // the actual gate here — this call can come back 409 if someone else took the bed first,
-      // which is the whole reason this logic lives server-side instead of only in this browser.
       try {
         const booking = await apiClient.createBooking(ctx.settings, {
           property_id: ctx.settings.apiPropertyId, customer_name: slots.customerName, customer_phone: slots.customerPhone,
@@ -1061,7 +1064,6 @@ function WhatsAppScreen({ ctx }) {
       return;
     }
 
-    // Prototype path (default): local state + window.storage, unchanged from before.
     const now = new Date(ctx.virtualNow());
     const bookingId = makeBookingId(ctx.bookings, now);
     const booking = {
@@ -1912,7 +1914,7 @@ function SettingsScreen({ ctx }) {
             <p className="text-[11px] text-stone-400 mt-1.5">
               {s.dataMode === "prototype"
                 ? "Everything runs in this browser session's persistent storage — nothing leaves the browser. This is the default and what every screen has been using."
-                : "New WhatsApp AI bookings call the Laravel API below (see kush-stay-laravel-backend.zip). Other admin actions (editing, cancelling, OTA sync, demo controls) still write to local state only — see the README's \"not fully built yet\" list."}
+                : "New WhatsApp AI bookings call the Laravel API below (see kush-stay-laravel-backend.zip). Other admin actions (editing, cancelling, OTA sync, pass system, demo controls) still write to local state only — see the README's \"not fully built yet\" list."}
             </p>
           </div>
           {s.dataMode === "production" && (<>
@@ -2068,15 +2070,579 @@ function LoginGate({ onLogin }) {
     </Card>
   );
 }
+/* ---------------- 30-DAY PASS SYSTEM: CONSTANTS + ENGINE ---------------- */
+const PASS_CATEGORIES = ["NAC-Upper", "NAC-Lower", "AC-Upper", "AC-Lower"];
+const PASS_CATEGORY_LABELS = { "NAC-Upper": "Upper Non-AC", "NAC-Lower": "Lower Non-AC", "AC-Upper": "Upper AC", "AC-Lower": "Lower AC" };
+const PASS_STATUSES = ["pending", "payment_pending", "paid", "active", "expired", "suspended", "cancelled", "refunded"];
+
+const DEFAULT_PASS_PRODUCTS = [
+  { category: "NAC-Upper", displayName: "Upper Non-AC", normalPrice: 5500, grandOpeningPrice: 4500, totalDays: 30, active: true },
+  { category: "NAC-Lower", displayName: "Lower Non-AC", normalPrice: 6500, grandOpeningPrice: 5500, totalDays: 30, active: true },
+  { category: "AC-Upper", displayName: "Upper AC", normalPrice: 6500, grandOpeningPrice: 5500, totalDays: 30, active: true },
+  { category: "AC-Lower", displayName: "Lower AC", normalPrice: 7500, grandOpeningPrice: 6500, totalDays: 30, active: true },
+];
+// Exact matrix from the spec, per night, in rupees (kept as plain numbers on the frontend,
+// consistent with the rest of this file — the Laravel backend stores the same values as integer
+// paise, per the "never use floats for money" requirement on the server side of the system).
+const PASS_UPGRADE_MATRIX = {
+  "NAC-Upper": { "NAC-Upper": 0, "NAC-Lower": 40, "AC-Upper": 40, "AC-Lower": 80 },
+  "NAC-Lower": { "NAC-Upper": 0, "NAC-Lower": 0, "AC-Upper": 40, "AC-Lower": 80 },
+  "AC-Upper": { "NAC-Upper": 0, "NAC-Lower": 0, "AC-Upper": 0, "AC-Lower": 40 },
+  "AC-Lower": { "NAC-Upper": 0, "NAC-Lower": 0, "AC-Upper": 0, "AC-Lower": 0 },
+};
+const DEFAULT_PASS_SETTINGS = { grandOpeningActive: true, grandOpeningLimit: 150, grandOpeningSold: 0 };
+
+function passCategoryOfBed(bedId) { const { room, type } = bedMeta(bedId); return `${room === "AC" ? "AC" : "NAC"}-${type}`; }
+function categoryRoomKey(category) { return category.startsWith("AC-") ? "AC" : "NAC"; }
+function categoryPosition(category) { return category.endsWith("Upper") ? "Upper" : "Lower"; }
+
+function currentPassPrice(product, settings) { return settings.grandOpeningActive ? product.grandOpeningPrice : product.normalPrice; }
+
+/** Activation date through the day before the same calendar date one year later (e.g. 06 Sep 2026 -> 05 Sep 2027). */
+function passExpiryDate(activatedIso) {
+  const d = new Date(activatedIso + "T00:00:00");
+  d.setFullYear(d.getFullYear() + 1);
+  d.setDate(d.getDate() - 1);
+  return toISO(d);
+}
+
+function makePassRef(passes) { return "KS-PASS-" + String(passes.length + 1).padStart(3, "0"); }
+
+/**
+ * For each of the 4 bed categories: is at least one bed of that category free for the range,
+ * and what would the upgrade fee be relative to this pass's base category? Never silently
+ * substitutes — this is purely a read of live availability, same engine as everything else.
+ */
+function passPreviewAvailability(baseCategory, checkIn, checkOut, bookings, holds, blocked) {
+  const nights = nightsBetween(checkIn, checkOut);
+  const options = {};
+  PASS_CATEGORIES.forEach(cat => {
+    const roomKey = categoryRoomKey(cat), position = categoryPosition(cat);
+    const free = getAvailableBeds(roomKey, checkIn, checkOut, bookings, holds, blocked, position);
+    const feePerNight = PASS_UPGRADE_MATRIX[baseCategory][cat];
+    options[cat] = { available: free.length > 0, freeBedId: free[0] || null, feePerNight, upgradeTotal: feePerNight * nights };
+  });
+  return { nights, options };
+}
+/* ---------------- PASS SYSTEM UI ---------------- */
+function PassLandingCard({ onStart, onLogin, settings }) {
+  const soldOut = settings.grandOpeningActive && settings.grandOpeningSold >= settings.grandOpeningLimit;
+  return (
+    <Card className="p-6 max-w-xl mx-auto text-center">
+      <Sparkles className="mx-auto mb-2 text-teal-600" size={28} />
+      <h2 className="text-xl font-semibold text-stone-900 mb-1">30-Day Kush Stay Pass</h2>
+      <p className="text-sm text-stone-600 mb-4">30 accommodation days, valid for 1 year. Use them whenever you like — they don't need to be consecutive. All stays are subject to bed availability.</p>
+      {soldOut ? (
+        <Badge tone="rose">GRAND OPENING PASSES SOLD OUT</Badge>
+      ) : settings.grandOpeningActive ? (
+        <Badge tone="teal">Grand Opening pricing — {settings.grandOpeningLimit - settings.grandOpeningSold} of {settings.grandOpeningLimit} left</Badge>
+      ) : null}
+      <div className="flex flex-col gap-2 mt-4">
+        {!soldOut && <Btn onClick={onStart}>Get your pass</Btn>}
+        <Btn tone="secondary" onClick={onLogin}>I already have a pass</Btn>
+      </div>
+    </Card>
+  );
+}
+
+function PassSelectStep({ products, settings, onSelect }) {
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">Choose your pass category</p>
+      <div className="space-y-2">
+        {products.filter(p => p.active).map(p => (
+          <button key={p.category} onClick={() => onSelect(p)} className="w-full text-left border border-stone-200 rounded-xl p-3.5 hover:border-teal-400 hover:bg-teal-50/40 flex items-center justify-between">
+            <div><p className="font-medium text-stone-900">{p.displayName}</p><p className="text-xs text-stone-400">30 days · 1 year validity</p></div>
+            <div className="text-right">
+              {settings.grandOpeningActive && <p className="text-xs text-stone-400 line-through">{fmtMoney(p.normalPrice)}</p>}
+              <p className="font-semibold text-teal-700">{fmtMoney(currentPassPrice(p, settings))}</p>
+            </div>
+          </button>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function PassDetailsStep({ onSubmit }) {
+  const [f, setF] = useState({ name: "", email: "", phone: "" });
+  const valid = f.name.trim() && /^\S+@\S+\.\S+$/.test(f.email) && /^\d{10}$/.test(f.phone);
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">Your details</p>
+      <Field label="Full name"><TextInput value={f.name} onChange={e => setF({ ...f, name: e.target.value })} /></Field>
+      <Field label="Email"><TextInput type="email" value={f.email} onChange={e => setF({ ...f, email: e.target.value })} /></Field>
+      <Field label="Mobile number"><TextInput value={f.phone} onChange={e => setF({ ...f, phone: e.target.value })} /></Field>
+      <Btn disabled={!valid} onClick={() => onSubmit(f)}>Continue to email verification</Btn>
+    </Card>
+  );
+}
+
+function PassOtpStep({ email, otpState, onSend, onVerify }) {
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState("");
+  const secondsLeft = otpState.lastSentAt ? Math.max(0, 60 - Math.floor((Date.now() - otpState.lastSentAt) / 1000)) : 0;
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-1">Verify your email</p>
+      <p className="text-xs text-stone-500 mb-3">We sent a 6-digit code to {email}. It expires in 10 minutes.</p>
+      {otpState.devCode && <p className="text-xs bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mb-3">Demo mode (no real email configured) — your code is <b>{otpState.devCode}</b></p>}
+      <Field label="6-digit code"><TextInput value={code} maxLength={6} onChange={e => setCode(e.target.value.replace(/\D/g, ""))} /></Field>
+      {err && <p className="text-xs text-rose-600 mb-2">{err}</p>}
+      <div className="flex gap-2">
+        <Btn onClick={() => { const r = onVerify(code); if (!r.ok) setErr(r.error); }}>Verify</Btn>
+        <Btn tone="secondary" disabled={secondsLeft > 0} onClick={onSend}>{secondsLeft > 0 ? `Resend in ${secondsLeft}s` : "Resend code"}</Btn>
+      </div>
+      <p className="text-[11px] text-stone-400 mt-2">{otpState.attempts || 0}/5 attempts used.</p>
+    </Card>
+  );
+}
+
+function PassPaymentStep({ amount, onOutcome }) {
+  const [status, setStatus] = useState("choosing");
+  const [method, setMethod] = useState(null);
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-1">Payment</p>
+      <p className="text-sm text-stone-600 mb-3">Amount payable: <span className="font-semibold">{fmtMoney(amount)}</span></p>
+      {status === "choosing" && (
+        <div className="grid grid-cols-2 gap-1.5">
+          {["UPI", "Card", "Cash at property", "Pay later"].map(m => (
+            <button key={m} onClick={() => { setMethod(m); setStatus("processing"); }} className="py-2 rounded-lg border border-stone-300 text-sm hover:bg-stone-50">{m}</button>
+          ))}
+        </div>
+      )}
+      {status === "processing" && (<>
+        <p className="text-xs text-stone-400 mb-2">(Simulated {method} payment — no real gateway connected yet)</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          <Btn tone="primary" onClick={() => onOutcome(true, method)}>Simulate success</Btn>
+          <Btn tone="danger" onClick={() => onOutcome(false, method)}>Simulate failure</Btn>
+        </div>
+      </>)}
+    </Card>
+  );
+}
+
+function PassTermsCard() {
+  const terms = [
+    "Each pass provides up to 30 accommodation days.", "The pass is valid for one year from activation.",
+    "Days may be used across multiple stays.", "Accommodation is always subject to availability.",
+    "The pass does not guarantee a bed on any particular date.", "The customer may select any available bed category.",
+    "Higher-category beds may require an additional per-night upgrade fee.",
+    "Choosing a lower-category bed does not generate a cash refund, credit, or additional pass day.",
+    "One pass day is consumed for each accommodation night.", "Checkout date is not counted as an accommodation night.",
+    "The pass is personal/non-transferable unless Kush Stay explicitly permits otherwise.",
+    "Unused days expire when the pass expires unless Kush Stay authorizes an extension.",
+    "Cancellation and refund rules are governed by the applicable policy.",
+  ];
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">Terms & conditions</p>
+      <ol className="text-xs text-stone-600 space-y-1.5 list-decimal pl-4">{terms.map((t, i) => <li key={i}>{t}</li>)}</ol>
+    </Card>
+  );
+}
+function PassLoginStep({ onSend, onVerify, otpState }) {
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState("");
+  const sent = otpState.email === email && otpState.lastSentAt;
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">My Kush Stay Pass</p>
+      <Field label="Email used at purchase"><TextInput type="email" value={email} onChange={e => setEmail(e.target.value)} /></Field>
+      {!sent ? <Btn disabled={!/^\S+@\S+\.\S+$/.test(email)} onClick={() => onSend(email)}>Send verification code</Btn> : (<>
+        {otpState.devCode && <p className="text-xs bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mb-2">Demo code: <b>{otpState.devCode}</b></p>}
+        <Field label="6-digit code"><TextInput value={code} maxLength={6} onChange={e => setCode(e.target.value.replace(/\D/g, ""))} /></Field>
+        {err && <p className="text-xs text-rose-600 mb-2">{err}</p>}
+        <Btn onClick={() => { const r = onVerify(email, code); if (!r.ok) setErr(r.error); }}>View my pass</Btn>
+      </>)}
+    </Card>
+  );
+}
+
+function PassDashboard({ pass, ledger, bookings, onBook, onHistory, onTerms, onLogout }) {
+  const product = PASS_CATEGORY_LABELS[pass.category];
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <div className="flex items-center justify-between mb-1"><p className="font-semibold text-stone-900">My Kush Stay Pass</p><button onClick={onLogout} className="text-xs text-stone-400 hover:text-stone-600">Log out</button></div>
+      <p className="text-xs text-stone-400 font-mono mb-3">{pass.passRef}</p>
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        <StatCard label="Total" value={pass.totalDays} />
+        <StatCard label="Used" value={pass.usedDays} />
+        <StatCard label="Remaining" value={pass.remainingDays} tone="teal" />
+      </div>
+      <p className="text-sm text-stone-600 mb-1">Category: <span className="font-medium text-stone-800">{product}</span></p>
+      <p className="text-sm text-stone-600 mb-4">Valid until: <span className="font-medium text-stone-800">{fmtDate(pass.expiresAt)}</span> · <StatusBadge status={pass.status} /></p>
+      <div className="flex flex-col gap-2">
+        <Btn onClick={onBook} disabled={pass.status !== "active" || pass.remainingDays <= 0}>Book my stay</Btn>
+        <Btn tone="secondary" onClick={onHistory}>Booking history ({bookings.length})</Btn>
+        <Btn tone="ghost" onClick={onTerms}>Terms & conditions</Btn>
+      </div>
+      {ledger.length > 0 && (
+        <div className="mt-4 pt-3 border-t border-stone-100">
+          <p className="text-xs font-medium text-stone-500 mb-1.5">Recent ledger activity</p>
+          {ledger.slice(0, 5).map(l => (
+            <div key={l.id} className="flex justify-between text-xs text-stone-600 py-0.5">
+              <span>{fmtDateShort(toISO(new Date(l.createdAt)))} · {l.eventType}</span><span className={l.dayChange >= 0 ? "text-emerald-600" : "text-rose-600"}>{l.dayChange >= 0 ? "+" : ""}{l.dayChange} → {l.balanceAfter}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function PassBookStep({ pass, ctx, onConfirm, onBack }) {
+  const [checkIn, setCheckIn] = useState(ctx.todayIso);
+  const [checkOut, setCheckOut] = useState(addDays(ctx.todayIso, 1));
+  const preview = checkOut > checkIn ? passPreviewAvailability(pass.category, checkIn, checkOut, ctx.bookings, ctx.holds, ctx.blockedBeds) : null;
+  const [selected, setSelected] = useState(null);
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">Book with your pass</p>
+      <p className="text-xs text-stone-500 mb-3">{pass.remainingDays} day(s) remaining · base category {PASS_CATEGORY_LABELS[pass.category]}</p>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <Field label="Check-in"><TextInput type="date" value={checkIn} onChange={e => setCheckIn(e.target.value)} /></Field>
+        <Field label="Check-out"><TextInput type="date" value={checkOut} onChange={e => setCheckOut(e.target.value)} /></Field>
+      </div>
+      {preview && preview.nights > pass.remainingDays && <p className="text-xs text-rose-600 mb-3">You have only {pass.remainingDays} pass day(s) remaining — this stay needs {preview.nights}.</p>}
+      {preview && preview.nights <= pass.remainingDays && (
+        <div className="space-y-2 mb-3">
+          {PASS_CATEGORIES.map(cat => {
+            const o = preview.options[cat];
+            return (
+              <button key={cat} disabled={!o.available} onClick={() => setSelected(cat)} className={`w-full text-left border rounded-xl p-3 flex items-center justify-between ${selected === cat ? "border-teal-500 bg-teal-50/40" : "border-stone-200"} ${!o.available ? "opacity-40 cursor-not-allowed" : "hover:border-teal-400"}`}>
+                <span className="font-medium text-sm">{PASS_CATEGORY_LABELS[cat]}</span>
+                <span className="text-xs text-stone-500">{o.available ? (o.feePerNight > 0 ? `${fmtMoney(o.feePerNight)}/night upgrade` : "No upgrade fee") : "Unavailable"}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {selected && preview.options[selected].feePerNight > 0 && (
+        <p className="text-xs bg-stone-50 rounded-lg p-2 mb-3">No refund or additional pass days are provided when choosing a lower-category bed. One pass day is used for each night.</p>
+      )}
+      <div className="flex gap-2">
+        <Btn disabled={!selected} onClick={() => onConfirm(checkIn, checkOut, selected, preview.nights, preview.options[selected])}>
+          {selected && preview.options[selected].upgradeTotal > 0 ? `Confirm & pay ${fmtMoney(preview.options[selected].upgradeTotal)}` : "Confirm booking"}
+        </Btn>
+        <Btn tone="secondary" onClick={onBack}>Back</Btn>
+      </div>
+    </Card>
+  );
+}
+
+function PassHistoryCard({ bookings, onBack }) {
+  return (
+    <Card className="p-5 max-w-xl mx-auto">
+      <p className="font-semibold text-stone-900 mb-3">Booking history</p>
+      {bookings.length === 0 ? <EmptyState icon={CalendarDays} text="No bookings yet" /> : (
+        <div className="space-y-2">{bookings.map(b => (
+          <div key={b.id} className="border border-stone-100 rounded-lg p-2.5 text-xs">
+            <div className="flex justify-between"><span className="font-medium">{b.bookingRef}</span><StatusBadge status={b.bookingStatus} /></div>
+            <p className="text-stone-500 mt-0.5">{fmtDateShort(b.checkIn)} → {fmtDateShort(b.checkOut)} · {PASS_CATEGORY_LABELS[b.usedCategory]} · {b.nights} night(s) · {b.daysConsumed} day(s) used{b.upgradeFee > 0 ? ` · upgrade ${fmtMoney(b.upgradeFee)}` : ""}</p>
+          </div>
+        ))}</div>
+      )}
+      <Btn tone="secondary" onClick={onBack} className="mt-3">Back</Btn>
+    </Card>
+  );
+}
+function PassScreen({ ctx }) {
+  const [view, setView] = useState("landing");
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [customer, setCustomer] = useState(null);
+  const [otp, setOtp] = useState({ email: null, purpose: null, code: null, expiresAt: null, attempts: 0, lastSentAt: null, devCode: null, verifiedToken: null, consumed: false });
+  const [reservedPass, setReservedPass] = useState(null);
+  const [activePass, setActivePass] = useState(null);
+  const [pendingPassBooking, setPendingPassBooking] = useState(null);
+  const [bookOutcome, setBookOutcome] = useState(null);
+
+  const myLedger = activePass ? ctx.passLedger.filter(l => l.passId === activePass.id).sort((a, b) => b.id - a.id) : [];
+  const myBookings = activePass ? ctx.passBookingsLink.filter(pb => pb.passId === activePass.id).sort((a, b) => b.id - a.id) : [];
+
+  function sendOtp(email, purpose = "purchase") {
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    setOtp({ email, purpose, code, expiresAt: ctx.virtualNow() + 10 * 60000, attempts: 0, lastSentAt: Date.now(), devCode: code, verifiedToken: null, consumed: false });
+  }
+  function verifyOtp(email, code) {
+    if (otp.email !== email || !otp.code) return { ok: false, error: "Request a code first." };
+    if (ctx.virtualNow() > otp.expiresAt) return { ok: false, error: "This code has expired. Request a new one." };
+    if (otp.attempts >= 5) return { ok: false, error: "Too many incorrect attempts. Request a new code." };
+    if (code !== otp.code) { setOtp(prev => ({ ...prev, attempts: prev.attempts + 1 })); return { ok: false, error: "Incorrect code." }; }
+    const token = uid("OTPSESS");
+    setOtp(prev => ({ ...prev, verifiedToken: token, consumed: false }));
+    return { ok: true, token };
+  }
+
+  function reservePass(product, custData) {
+    const settings = ctx.passSettings;
+    if (settings.grandOpeningActive && settings.grandOpeningSold >= settings.grandOpeningLimit) {
+      alert("Grand Opening passes sold out."); setView("landing"); return;
+    }
+    const grandOpening = settings.grandOpeningActive;
+    const price = currentPassPrice(product, settings);
+    const pass = {
+      id: uid("PASS"), passRef: makePassRef(ctx.passes), customerName: custData.name, customerEmail: custData.email, customerPhone: custData.phone,
+      category: product.category, grandOpening, pricePaid: price, totalDays: product.totalDays, usedDays: 0, remainingDays: 0,
+      status: "payment_pending", reservedUntil: ctx.virtualNow() + 15 * 60000, activatedAt: null, expiresAt: null, createdAt: Date.now(),
+    };
+    ctx.setPasses(prev => [...prev, pass]);
+    if (grandOpening) ctx.setPassSettings(prev => ({ ...prev, grandOpeningSold: prev.grandOpeningSold + 1 }));
+    setReservedPass(pass);
+    setOtp(prev => ({ ...prev, consumed: true }));
+    setView("payment");
+  }
+
+  function confirmPassPayment(success) {
+    if (!success) {
+      ctx.setPasses(prev => prev.map(p => p.id === reservedPass.id ? { ...p, status: "cancelled" } : p));
+      if (reservedPass.grandOpening) ctx.setPassSettings(prev => ({ ...prev, grandOpeningSold: Math.max(0, prev.grandOpeningSold - 1) }));
+      setView("select");
+      return;
+    }
+    const activatedAt = ctx.todayIso;
+    const expiresAt = passExpiryDate(activatedAt);
+    const activated = { ...reservedPass, status: "active", activatedAt, expiresAt, remainingDays: reservedPass.totalDays };
+    ctx.setPasses(prev => prev.map(p => p.id === reservedPass.id ? activated : p));
+    ctx.setPassLedger(prev => [...prev, { id: prev.length + 1, passId: reservedPass.id, eventType: "grant", dayChange: reservedPass.totalDays, balanceAfter: reservedPass.totalDays, reason: "Pass activated", createdAt: Date.now() }]);
+    setActivePass(activated);
+    setView("confirmation");
+  }
+
+  function loginSendOtp(email) { sendOtp(email, "login"); }
+  function loginVerifyOtp(email, code) {
+    const r = verifyOtp(email, code);
+    if (!r.ok) return r;
+    const found = ctx.passes.filter(p => p.customerEmail === email && ["active", "expired", "suspended"].includes(p.status)).sort((a, b) => b.createdAt - a.createdAt)[0];
+    if (!found) return { ok: false, error: "No pass found for this email." };
+    setActivePass(found);
+    setView("dashboard");
+    return { ok: true };
+  }
+
+  function goBook() { setBookOutcome(null); setView("book"); }
+
+  function confirmPassBooking(checkIn, checkOut, category, nights, optionInfo) {
+    const pass = ctx.passes.find(p => p.id === activePass.id); // latest
+    if (nights > pass.remainingDays) { alert(`Only ${pass.remainingDays} day(s) remaining.`); return; }
+    const roomKey = categoryRoomKey(category), position = categoryPosition(category);
+    const free = getAvailableBeds(roomKey, checkIn, checkOut, ctx.bookings, ctx.holds, ctx.blockedBeds, position);
+    if (!free.length) { alert("Sorry, that bed is no longer available."); return; }
+    const bedId = free[0];
+    const requiresPayment = optionInfo.upgradeTotal > 0;
+    const bookingId = makeBookingId(ctx.bookings, new Date(ctx.virtualNow()));
+
+    const booking = {
+      bookingId, source: "Pass", customerName: pass.customerName, customerPhone: pass.customerPhone, customerEmail: pass.customerEmail,
+      checkIn, checkOut, guestCount: 1, bookingType: "individual", roomKey, bedIds: [bedId], nights,
+      subtotal: optionInfo.upgradeTotal, discount: 0, tax: 0, total: optionInfo.upgradeTotal,
+      amountPaid: requiresPayment ? 0 : optionInfo.upgradeTotal, balance: requiresPayment ? optionInfo.upgradeTotal : 0,
+      paymentStatus: requiresPayment ? "Unpaid" : "Paid", paymentMethod: null,
+      bookingStatus: requiresPayment ? "Pending" : "Confirmed",
+      specialRequest: `Pass ${pass.passRef} (${PASS_CATEGORY_LABELS[pass.category]} base, ${PASS_CATEGORY_LABELS[category]} used)`,
+      createdAt: Date.now(), updatedAt: Date.now(),
+    };
+    ctx.setBookings(prev => [...prev, booking]);
+
+    const passBookingLink = { id: ctx.passBookingsLink.length + 1, passId: pass.id, bookingId, baseCategory: pass.category, usedCategory: category, nights, daysConsumed: requiresPayment ? 0 : nights, upgradeFee: optionInfo.upgradeTotal, upgradePaymentStatus: requiresPayment ? "pending" : "not_required" };
+    ctx.setPassBookingsLink(prev => [...prev, passBookingLink]);
+
+    if (!requiresPayment) {
+      const newBalance = pass.remainingDays - nights;
+      ctx.setPasses(prev => prev.map(p => p.id === pass.id ? { ...p, remainingDays: newBalance, usedDays: p.usedDays + nights } : p));
+      ctx.setPassLedger(prev => [...prev, { id: prev.length + 1, passId: pass.id, eventType: "booking", dayChange: -nights, balanceAfter: newBalance, reason: `Booking ${bookingId}`, createdAt: Date.now() }]);
+      setActivePass(prev => ({ ...prev, remainingDays: newBalance, usedDays: prev.usedDays + nights }));
+      setBookOutcome({ ok: true, requiresPayment: false });
+      setView("dashboard");
+    } else {
+      setPendingPassBooking({ ...passBookingLink, passRef: pass.passRef, passIdRef: pass.id });
+      setView("bookPayment");
+    }
+  }
+
+  function confirmUpgradePayment(success) {
+    const pb = pendingPassBooking;
+    if (!success) {
+      ctx.setBookings(prev => prev.map(b => b.bookingId === pb.bookingId ? { ...b, bookingStatus: "Cancelled", paymentStatus: "Refunded" } : b));
+      ctx.setPassBookingsLink(prev => prev.map(x => x.id === pb.id ? { ...x, upgradePaymentStatus: "failed" } : x));
+      setView("dashboard");
+      return;
+    }
+    const pass = ctx.passes.find(p => p.id === pb.passIdRef);
+    const newBalance = pass.remainingDays - pb.nights;
+    ctx.setPasses(prev => prev.map(p => p.id === pass.id ? { ...p, remainingDays: newBalance, usedDays: p.usedDays + pb.nights } : p));
+    ctx.setPassLedger(prev => [...prev, { id: prev.length + 1, passId: pass.id, eventType: "booking", dayChange: -pb.nights, balanceAfter: newBalance, reason: `Booking ${pb.bookingId} (upgrade)`, createdAt: Date.now() }]);
+    ctx.setPassBookingsLink(prev => prev.map(x => x.id === pb.id ? { ...x, upgradePaymentStatus: "paid", daysConsumed: pb.nights } : x));
+    ctx.setBookings(prev => prev.map(b => b.bookingId === pb.bookingId ? { ...b, bookingStatus: "Confirmed", paymentStatus: "Paid", amountPaid: b.total, balance: 0 } : b));
+    setActivePass(prev => ({ ...prev, remainingDays: newBalance, usedDays: prev.usedDays + pb.nights }));
+    setView("dashboard");
+  }
+
+  return (
+    <div className="py-2">
+      {view === "landing" && <PassLandingCard settings={ctx.passSettings} onStart={() => setView("select")} onLogin={() => { setOtp({ email: null, purpose: null, code: null, expiresAt: null, attempts: 0, lastSentAt: null, devCode: null, verifiedToken: null, consumed: false }); setView("login"); }} />}
+      {view === "select" && <PassSelectStep products={ctx.passProducts} settings={ctx.passSettings} onSelect={p => { setSelectedProduct(p); setView("details"); }} />}
+      {view === "details" && <PassDetailsStep onSubmit={f => { setCustomer(f); sendOtp(f.email, "purchase"); setView("otp"); }} />}
+      {view === "otp" && <PassOtpStep email={customer?.email} otpState={otp} onSend={() => sendOtp(customer.email, "purchase")} onVerify={code => { const r = verifyOtp(customer.email, code); if (r.ok) reservePass(selectedProduct, customer); return r; }} />}
+      {view === "payment" && reservedPass && <PassPaymentStep amount={reservedPass.pricePaid} onOutcome={(ok) => confirmPassPayment(ok)} />}
+      {view === "confirmation" && activePass && (
+        <Card className="p-5 max-w-xl mx-auto text-center">
+          <CheckCircle2 className="mx-auto mb-2 text-emerald-600" size={28} />
+          <p className="font-semibold text-stone-900 mb-1">Pass activated!</p>
+          <p className="text-sm text-stone-600 mb-3">{activePass.passRef} · {PASS_CATEGORY_LABELS[activePass.category]} · {fmtMoney(activePass.pricePaid)}</p>
+          <p className="text-xs text-stone-500 mb-4">30 days, valid {fmtDate(activePass.activatedAt)} through {fmtDate(activePass.expiresAt)}</p>
+          <Btn onClick={() => setView("dashboard")}>Go to My Pass</Btn>
+        </Card>
+      )}
+      {view === "login" && <PassLoginStep otpState={otp} onSend={loginSendOtp} onVerify={loginVerifyOtp} />}
+      {view === "dashboard" && activePass && <PassDashboard pass={ctx.passes.find(p => p.id === activePass.id) || activePass} ledger={myLedger} bookings={myBookings} onBook={goBook} onHistory={() => setView("history")} onTerms={() => setView("terms")} onLogout={() => { setActivePass(null); setView("landing"); }} />}
+      {view === "book" && activePass && <PassBookStep pass={ctx.passes.find(p => p.id === activePass.id)} ctx={ctx} onConfirm={confirmPassBooking} onBack={() => setView("dashboard")} />}
+      {view === "bookPayment" && pendingPassBooking && <PassPaymentStep amount={pendingPassBooking.upgradeFee} onOutcome={confirmUpgradePayment} />}
+      {view === "history" && <PassHistoryCard bookings={myBookings} onBack={() => setView("dashboard")} />}
+      {view === "terms" && <><PassTermsCard /><div className="max-w-xl mx-auto mt-2"><Btn tone="secondary" onClick={() => setView(activePass ? "dashboard" : "landing")}>Back</Btn></div></>}
+    </div>
+  );
+}
+/* ---------------- ADMIN: PASS MANAGEMENT ---------------- */
+function PassAdminScreen({ ctx }) {
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState(null);
+  const [reasonPrompt, setReasonPrompt] = useState(null); // {action, passId}
+
+  const passes = ctx.passes.filter(p =>
+    !search || p.passRef.toLowerCase().includes(search.toLowerCase()) || p.customerName.toLowerCase().includes(search.toLowerCase()) ||
+    (p.customerEmail || "").toLowerCase().includes(search.toLowerCase()) || (p.customerPhone || "").includes(search)
+  ).sort((a, b) => b.createdAt - a.createdAt);
+
+  const byStatus = {};
+  PASS_STATUSES.forEach(s => { byStatus[s] = ctx.passes.filter(p => p.status === s).length; });
+  const revenue = ctx.passes.filter(p => ["active", "expired", "suspended", "cancelled"].includes(p.status)).reduce((s, p) => s + p.pricePaid, 0);
+  const daysIssued = ctx.passes.filter(p => !["pending", "payment_pending", "refunded"].includes(p.status)).reduce((s, p) => s + p.totalDays, 0);
+  const daysConsumed = ctx.passes.reduce((s, p) => s + p.usedDays, 0);
+  const daysRemaining = ctx.passes.reduce((s, p) => s + p.remainingDays, 0);
+  const upgradeRevenue = ctx.passBookingsLink.filter(pb => pb.upgradePaymentStatus === "paid").reduce((s, pb) => s + pb.upgradeFee, 0);
+
+  function applyAction(action, passId, reason) {
+    const map = { suspend: "suspended", reactivate: "active", cancel: "cancelled" };
+    const pass = ctx.passes.find(p => p.id === passId);
+    const before = { status: pass.status };
+    ctx.setPasses(prev => prev.map(p => p.id === passId ? { ...p, status: map[action] } : p));
+    ctx.setPassAuditLog(prev => [...prev, { id: prev.length + 1, passId, action, before, after: { status: map[action] }, reason, createdAt: Date.now() }]);
+    setReasonPrompt(null);
+  }
+  function adjustBalance(passId, dayChange, reason) {
+    const pass = ctx.passes.find(p => p.id === passId);
+    const newBalance = Math.max(0, pass.remainingDays + dayChange);
+    const before = { remainingDays: pass.remainingDays, usedDays: pass.usedDays };
+    ctx.setPasses(prev => prev.map(p => p.id === passId ? { ...p, remainingDays: newBalance, usedDays: p.totalDays - newBalance } : p));
+    ctx.setPassLedger(prev => [...prev, { id: prev.length + 1, passId, eventType: "adjustment", dayChange, balanceAfter: newBalance, reason, createdAt: Date.now() }]);
+    ctx.setPassAuditLog(prev => [...prev, { id: prev.length + 1, passId, action: "adjust_balance", before, after: { remainingDays: newBalance, usedDays: pass.totalDays - newBalance }, reason, createdAt: Date.now() }]);
+    setReasonPrompt(null);
+  }
+
+  return (
+    <div>
+      <SectionTitle icon={Sparkles} title="Pass Management" sub="30-Day Kush Stay Pass — Grand Opening & ongoing sales" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <StatCard label="Total passes" value={ctx.passes.length} />
+        <StatCard label="Grand Opening sold" value={`${ctx.passSettings.grandOpeningSold}/${ctx.passSettings.grandOpeningLimit}`} tone={ctx.passSettings.grandOpeningSold >= ctx.passSettings.grandOpeningLimit ? "rose" : "teal"} />
+        <StatCard label="Active" value={byStatus.active} tone="emerald" />
+        <StatCard label="Expired" value={byStatus.expired} />
+        <StatCard label="Suspended" value={byStatus.suspended} tone="amber" />
+        <StatCard label="Cancelled" value={byStatus.cancelled} tone="rose" />
+        <StatCard label="Revenue" value={fmtMoney(revenue)} tone="emerald" />
+        <StatCard label="Upgrade revenue" value={fmtMoney(upgradeRevenue)} tone="teal" />
+        <StatCard label="Days issued" value={daysIssued} />
+        <StatCard label="Days consumed" value={daysConsumed} />
+        <StatCard label="Days remaining" value={daysRemaining} />
+        <StatCard label="Pass bookings" value={ctx.passBookingsLink.length} />
+      </div>
+      <div className="flex gap-2 mb-3"><TextInput placeholder="Search pass ID, name, email, phone…" value={search} onChange={e => setSearch(e.target.value)} className="max-w-sm" /></div>
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-stone-50 text-stone-500 text-xs uppercase"><tr><th className="text-left px-3 py-2.5">Pass</th><th className="text-left px-3 py-2.5">Customer</th><th className="text-left px-3 py-2.5">Category</th><th className="text-left px-3 py-2.5">Days</th><th className="text-left px-3 py-2.5">Status</th><th className="text-left px-3 py-2.5">Expires</th></tr></thead>
+          <tbody>{passes.map(p => (
+            <tr key={p.id} className="border-t border-stone-100 hover:bg-stone-50 cursor-pointer" onClick={() => setSelected(p)}>
+              <td className="px-3 py-2.5 font-mono text-xs">{p.passRef}</td>
+              <td className="px-3 py-2.5">{p.customerName}<br /><span className="text-xs text-stone-400">{p.customerEmail}</span></td>
+              <td className="px-3 py-2.5 text-xs">{PASS_CATEGORY_LABELS[p.category]}</td>
+              <td className="px-3 py-2.5 text-xs">{p.remainingDays}/{p.totalDays}</td>
+              <td className="px-3 py-2.5"><StatusBadge status={p.status} /></td>
+              <td className="px-3 py-2.5 text-xs">{p.expiresAt ? fmtDateShort(p.expiresAt) : "—"}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+        {passes.length === 0 && <EmptyState icon={Sparkles} text="No passes match this search" />}
+      </Card>
+
+      {selected && (
+        <Modal open title={selected.passRef} onClose={() => setSelected(null)} wide>
+          <div className="text-sm space-y-1 text-stone-700 mb-4">
+            <p><span className="text-stone-400">Customer:</span> {selected.customerName} · {selected.customerEmail} · {selected.customerPhone}</p>
+            <p><span className="text-stone-400">Category:</span> {PASS_CATEGORY_LABELS[selected.category]} · <span className="text-stone-400">Paid:</span> {fmtMoney(selected.pricePaid)} {selected.grandOpening && <Badge tone="teal">Grand Opening</Badge>}</p>
+            <p><span className="text-stone-400">Days:</span> {selected.usedDays} used / {selected.remainingDays} remaining / {selected.totalDays} total</p>
+            <p><span className="text-stone-400">Activated:</span> {selected.activatedAt ? fmtDate(selected.activatedAt) : "—"} · <span className="text-stone-400">Expires:</span> {selected.expiresAt ? fmtDate(selected.expiresAt) : "—"}</p>
+            <p><span className="text-stone-400">Status:</span> <StatusBadge status={selected.status} /></p>
+          </div>
+          <div className="flex flex-wrap gap-1.5 mb-4">
+            {selected.status === "active" && <Btn size="sm" tone="secondary" onClick={() => setReasonPrompt({ action: "suspend", passId: selected.id })}>Suspend</Btn>}
+            {selected.status === "suspended" && <Btn size="sm" tone="secondary" onClick={() => setReasonPrompt({ action: "reactivate", passId: selected.id })}>Reactivate</Btn>}
+            {!["cancelled", "refunded"].includes(selected.status) && <Btn size="sm" tone="danger" onClick={() => setReasonPrompt({ action: "cancel", passId: selected.id })}>Cancel</Btn>}
+            <Btn size="sm" tone="outline" onClick={() => setReasonPrompt({ action: "adjust", passId: selected.id })}>Adjust balance</Btn>
+          </div>
+          <p className="text-xs font-medium text-stone-500 mb-1.5">Ledger</p>
+          <div className="space-y-1 mb-4 max-h-40 overflow-y-auto">
+            {ctx.passLedger.filter(l => l.passId === selected.id).sort((a, b) => b.id - a.id).map(l => (
+              <div key={l.id} className="flex justify-between text-xs text-stone-600"><span>{fmtDateShort(toISO(new Date(l.createdAt)))} · {l.eventType} {l.reason ? `(${l.reason})` : ""}</span><span className={l.dayChange >= 0 ? "text-emerald-600" : "text-rose-600"}>{l.dayChange >= 0 ? "+" : ""}{l.dayChange} → {l.balanceAfter}</span></div>
+            ))}
+          </div>
+          <p className="text-xs font-medium text-stone-500 mb-1.5">Bookings</p>
+          <div className="space-y-1 mb-4">
+            {ctx.passBookingsLink.filter(pb => pb.passId === selected.id).map(pb => (
+              <div key={pb.id} className="text-xs text-stone-600">{pb.bookingId} · {PASS_CATEGORY_LABELS[pb.usedCategory]} · {pb.nights}n · {pb.daysConsumed}d used{pb.upgradeFee > 0 ? ` · upgrade ${fmtMoney(pb.upgradeFee)} (${pb.upgradePaymentStatus})` : ""}</div>
+            ))}
+          </div>
+          <p className="text-xs font-medium text-stone-500 mb-1.5">Audit history</p>
+          <div className="space-y-1">
+            {ctx.passAuditLog.filter(a => a.passId === selected.id).sort((a, b) => b.id - a.id).map(a => (
+              <div key={a.id} className="text-xs text-stone-500">{fmtDateTime(a.createdAt)} · {a.action} · "{a.reason}"</div>
+            ))}
+          </div>
+        </Modal>
+      )}
+
+      {reasonPrompt && (
+        <Modal open title={reasonPrompt.action === "adjust" ? "Adjust balance" : `Confirm ${reasonPrompt.action}`} onClose={() => setReasonPrompt(null)}>
+          <ReasonForm action={reasonPrompt.action} onSubmit={(reason, dayChange) => reasonPrompt.action === "adjust" ? adjustBalance(reasonPrompt.passId, dayChange, reason) : applyAction(reasonPrompt.action, reasonPrompt.passId, reason)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+function ReasonForm({ action, onSubmit }) {
+  const [reason, setReason] = useState("");
+  const [dayChange, setDayChange] = useState(0);
+  return (
+    <div>
+      {action === "adjust" && <Field label="Day change (+/-)"><TextInput type="number" value={dayChange} onChange={e => setDayChange(Number(e.target.value) || 0)} /></Field>}
+      <Field label="Reason (required)"><TextInput value={reason} onChange={e => setReason(e.target.value)} /></Field>
+      <Btn disabled={reason.trim().length < 5} onClick={() => onSubmit(reason, dayChange)}>Confirm</Btn>
+    </div>
+  );
+}
 /* ---------------- APP ---------------- */
 const NAV = [
   { id:"dashboard", label:"Dashboard", icon:LayoutDashboard, admin:true },
   { id:"whatsapp", label:"WhatsApp AI", icon:MessageCircle, admin:false },
+  { id:"pass", label:"30-Day Pass", icon:Sparkles, admin:false },
   { id:"bookings", label:"Bookings", icon:ClipboardList, admin:true },
   { id:"calendar", label:"Calendar", icon:CalendarDays, admin:true },
   { id:"beds", label:"Beds", icon:BedDouble, admin:true },
   { id:"customers", label:"Customers", icon:Users, admin:true },
   { id:"payments", label:"Payments", icon:Wallet, admin:true },
+  { id:"passadmin", label:"Passes", icon:Sparkles, admin:true },
   { id:"ota", label:"OTA & iCal", icon:Globe, admin:true },
   { id:"analytics", label:"Analytics", icon:BarChart3, admin:true },
   { id:"catalog", label:"Catalog", icon:Package, admin:true },
@@ -2101,6 +2667,12 @@ export default function App() {
   const [prices, setPrices] = useState(seed.prices);
   const [settings, setSettings] = useState(seed.settings);
   const [aiStats, setAiStats] = useState(seed.aiStats);
+  const [passProducts, setPassProducts] = useState(seed.passProducts);
+  const [passSettings, setPassSettings] = useState(seed.passSettings);
+  const [passes, setPasses] = useState(seed.passes);
+  const [passLedger, setPassLedger] = useState(seed.passLedger);
+  const [passBookingsLink, setPassBookingsLink] = useState(seed.passBookingsLink);
+  const [passAuditLog, setPassAuditLog] = useState(seed.passAuditLog);
   const [catalogActive, setCatalogActive] = useState(seed.catalogActive);
   const [holds, setHolds] = useState([]);
   const [syncLog, setSyncLog] = useState([]);
@@ -2122,6 +2694,12 @@ export default function App() {
           if (data.settings) setSettings(data.settings);
           if (data.aiStats) setAiStats(data.aiStats);
           if (data.catalogActive) setCatalogActive(data.catalogActive);
+          if (Array.isArray(data.passProducts) && data.passProducts.length) setPassProducts(data.passProducts);
+          if (data.passSettings) setPassSettings(data.passSettings);
+          if (Array.isArray(data.passes)) setPasses(data.passes);
+          if (Array.isArray(data.passLedger)) setPassLedger(data.passLedger);
+          if (Array.isArray(data.passBookingsLink)) setPassBookingsLink(data.passBookingsLink);
+          if (Array.isArray(data.passAuditLog)) setPassAuditLog(data.passAuditLog);
         }
       } catch (e) { /* nothing saved yet — keep seed demo data */ }
       if (!cancelled) setLoaded(true);
@@ -2134,11 +2712,11 @@ export default function App() {
     if (!loaded) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      const bundle = { bookings, leads, otaConnections, blockedBeds, customerExtras, prices, settings, aiStats, catalogActive };
+      const bundle = { bookings, leads, otaConnections, blockedBeds, customerExtras, prices, settings, aiStats, catalogActive, passProducts, passSettings, passes, passLedger, passBookingsLink, passAuditLog };
       window.storage.set("appState", JSON.stringify(bundle)).catch(() => {});
     }, 800);
     return () => clearTimeout(saveTimer.current);
-  }, [loaded, bookings, leads, otaConnections, blockedBeds, customerExtras, prices, settings, aiStats, catalogActive]);
+  }, [loaded, bookings, leads, otaConnections, blockedBeds, customerExtras, prices, settings, aiStats, catalogActive, passProducts, passSettings, passes, passLedger, passBookingsLink, passAuditLog]);
 
   const offsetRef = useRef(0);
   useEffect(() => { offsetRef.current = systemOffsetMs; }, [systemOffsetMs]);
@@ -2155,7 +2733,8 @@ export default function App() {
     blockedBeds, setBlockedBeds, customerExtras, setCustomerExtras, prices, setPrices, settings, setSettings,
     aiStats, setAiStats, catalogActive, setCatalogActive, syncLog, setSyncLog, systemOffsetMs, setSystemOffsetMs,
     virtualNow, todayIso,
-    roomIdByKey: (key) => (key === "AC" ? settings.acRoomApiId : settings.nacRoomApiId),
+    passProducts, setPassProducts, passSettings, setPassSettings, passes, setPasses,
+    passLedger, setPassLedger, passBookingsLink, setPassBookingsLink, passAuditLog, setPassAuditLog,
   };
 
   if (!loaded) {
@@ -2191,6 +2770,7 @@ export default function App() {
       </div>
       <main className="max-w-7xl mx-auto p-4">
         <div className={tab==="whatsapp"?"":"hidden"}><WhatsAppScreen ctx={ctx}/></div>
+        <div className={tab==="pass"?"":"hidden"}><PassScreen ctx={ctx}/></div>
         {isAdmin ? (
           <>
             <div className={tab==="dashboard"?"":"hidden"}><DashboardScreen ctx={ctx}/></div>
@@ -2199,12 +2779,13 @@ export default function App() {
             <div className={tab==="beds"?"":"hidden"}><BedsScreen ctx={ctx}/></div>
             <div className={tab==="customers"?"":"hidden"}><CustomersScreen ctx={ctx}/></div>
             <div className={tab==="payments"?"":"hidden"}><PaymentsScreen ctx={ctx}/></div>
+            <div className={tab==="passadmin"?"":"hidden"}><PassAdminScreen ctx={ctx}/></div>
             <div className={tab==="ota"?"":"hidden"}><OtaIcalScreen ctx={ctx}/></div>
             <div className={tab==="analytics"?"":"hidden"}><AnalyticsScreen ctx={ctx}/></div>
             <div className={tab==="catalog"?"":"hidden"}><CatalogScreen ctx={ctx}/></div>
             <div className={tab==="settings"?"":"hidden"}><SettingsScreen ctx={ctx}/></div>
           </>
-        ) : (tab !== "whatsapp" && <LoginGate onLogin={()=>setIsAdmin(true)} />)}
+        ) : (tab !== "whatsapp" && tab !== "pass" && <LoginGate onLogin={()=>setIsAdmin(true)} />)}
       </main>
       <DemoPanel ctx={ctx} open={showDemoPanel} onClose={()=>setShowDemoPanel(false)} />
     </div>

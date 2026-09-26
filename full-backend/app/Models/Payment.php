@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class Payment extends Model
 {
-    protected $fillable = ['booking_id', 'method', 'amount', 'status', 'gateway_reference', 'paid_at'];
+    protected $fillable = ['property_id', 'booking_id', 'method', 'amount', 'status', 'gateway_reference', 'paid_at'];
 
     protected function casts(): array
     {
